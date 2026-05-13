@@ -8,14 +8,54 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/Wei-Shaw/sub2api/internal/config"
 	"github.com/Wei-Shaw/sub2api/internal/pkg/apicompat"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/gjson"
 )
+
+// stubAccountRepoFor404Test is a minimal AccountRepository stub for 404 fallback tests.
+type stubAccountRepoFor404Test struct {
+	AccountRepository
+	account   *Account
+	mu        sync.Mutex
+	extras    []map[string]any
+	updatedCh chan struct{} // signaled on UpdateExtra
+}
+
+func (r *stubAccountRepoFor404Test) GetByID(_ context.Context, _ int64) (*Account, error) {
+	return r.account, nil
+}
+
+func (r *stubAccountRepoFor404Test) UpdateExtra(_ context.Context, _ int64, updates map[string]any) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	copied := make(map[string]any, len(updates))
+	for k, v := range updates {
+		copied[k] = v
+	}
+	r.extras = append(r.extras, copied)
+	if r.updatedCh != nil {
+		select {
+		case r.updatedCh <- struct{}{}:
+		default:
+		}
+	}
+	return nil
+}
+
+func (r *stubAccountRepoFor404Test) getExtras() []map[string]any {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]map[string]any, len(r.extras))
+	copy(out, r.extras)
+	return out
+}
 
 type openAIChatFailingWriter struct {
 	gin.ResponseWriter
@@ -370,4 +410,251 @@ func TestForwardAsChatCompletions_UpstreamRequestIgnoresClientCancel(t *testing.
 	require.NotNil(t, result)
 	require.NotNil(t, upstream.lastReq)
 	require.NoError(t, upstream.lastReq.Context().Err())
+}
+
+func TestForwardAsChatCompletions_Responses404FallbackToRawCC(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	// First request: Responses path returns 404.
+	// Second request: raw CC path returns successful Chat Completions response.
+	ccResponseBody := `data: {"id":"chatcmpl-1","object":"chat.completion","model":"gpt-5.4","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}` + "\n\ndata: [DONE]\n\n"
+	upstream := &httpUpstreamRecorder{
+		responses: []*http.Response{
+			{ // Responses path → 404
+				StatusCode: http.StatusNotFound,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"not found"}}`)),
+			},
+			{ // Raw CC path → success
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_404_fallback"}},
+				Body:       io.NopCloser(strings.NewReader(ccResponseBody)),
+			},
+		},
+	}
+
+	repo := &stubAccountRepoFor404Test{
+		account: &Account{
+			ID:          1,
+			Name:        "openai-apikey",
+			Platform:    PlatformOpenAI,
+			Type:        AccountTypeAPIKey,
+			Concurrency: 1,
+			Credentials: map[string]any{
+				"api_key": "sk-test-key",
+			},
+			Extra: map[string]any{
+				"openai_responses_supported": true,
+			},
+		},
+	}
+
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream, accountRepo: repo}
+	account := repo.account
+
+	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "gpt-5.4")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	// Verify the raw CC response body was written to the client.
+	require.Contains(t, rec.Body.String(), `"content":"hi"`)
+	// Verify the first request went to /v1/responses and second to /v1/chat/completions.
+	require.Len(t, upstream.requests, 2)
+	require.Contains(t, upstream.requests[0].URL.Path, "/responses")
+	require.Contains(t, upstream.requests[1].URL.Path, "/chat/completions")
+	// Verify the second request used the original Chat Completions body (model rewritten).
+	require.Equal(t, "gpt-5.4", gjson.GetBytes(upstream.bodies[1], "model").String())
+}
+
+func TestForwardAsChatCompletions_Non404ErrorDoesNotFallback(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	// Return 400 — should not trigger 404 fallback.
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusBadRequest,
+		Header:     http.Header{"Content-Type": []string{"application/json"}, "x-request-id": []string{"rid_400_no_fallback"}},
+		Body:       io.NopCloser(strings.NewReader(`{"error":{"type":"invalid_request_error","message":"bad request"}}`)),
+	}}
+
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{
+		ID:          1,
+		Name:        "openai-apikey",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key": "sk-test-key",
+		},
+		Extra: map[string]any{
+			"openai_responses_supported": true,
+		},
+	}
+
+	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "gpt-5.4")
+	// 400 from Responses path should not cause fallback — it goes through normal error handling.
+	require.Error(t, err)
+	require.Nil(t, result)
+	// Only one upstream request (no fallback).
+	require.Len(t, upstream.requests, 1)
+	require.Contains(t, upstream.requests[0].URL.Path, "/responses")
+}
+
+func TestForwardAsChatCompletions_Responses404UpdatesProbeFlag(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	ccResponseBody := `data: {"id":"chatcmpl-1","object":"chat.completion","model":"gpt-5.4","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}` + "\n\ndata: [DONE]\n\n"
+	upstream := &httpUpstreamRecorder{
+		responses: []*http.Response{
+			{
+				StatusCode: http.StatusNotFound,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"not found"}}`)),
+			},
+			{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_404_probe"}},
+				Body:       io.NopCloser(strings.NewReader(ccResponseBody)),
+			},
+		},
+	}
+
+	account := &Account{
+		ID:          42,
+		Name:        "openai-apikey",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key": "sk-test-key",
+		},
+		Extra: map[string]any{
+			"openai_responses_supported": true,
+		},
+	}
+	updatedCh := make(chan struct{}, 1)
+	repo := &stubAccountRepoFor404Test{account: account, updatedCh: updatedCh}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream, accountRepo: repo}
+
+	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "gpt-5.4")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+
+	// Wait for the async goroutine to complete via channel.
+	select {
+	case <-updatedCh:
+	case <-time.After(time.Second):
+		require.Fail(t, "UpdateExtra goroutine did not complete in time")
+	}
+
+	// Verify UpdateExtra was called with openai_responses_supported=false.
+	extras := repo.getExtras()
+	require.Len(t, extras, 1)
+	require.Equal(t, false, extras[0]["openai_responses_supported"])
+}
+
+func TestForwardAsChatCompletions_Responses404FallbackForOAuthNoDBUpdate(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hello"}],"stream":false}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	ccResponseBody := `data: {"id":"chatcmpl-1","object":"chat.completion","model":"gpt-5.4","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":1,"total_tokens":6}}` + "\n\ndata: [DONE]\n\n"
+	upstream := &httpUpstreamRecorder{
+		responses: []*http.Response{
+			{
+				StatusCode: http.StatusNotFound,
+				Header:     http.Header{"Content-Type": []string{"application/json"}},
+				Body:       io.NopCloser(strings.NewReader(`{"error":{"message":"not found"}}`)),
+			},
+			{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{"text/event-stream"}, "x-request-id": []string{"rid_404_oauth"}},
+				Body:       io.NopCloser(strings.NewReader(ccResponseBody)),
+			},
+		},
+	}
+
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{
+		ID:          99,
+		Name:        "openai-oauth",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"access_token":       "oauth-token",
+			"chatgpt_account_id": "chatgpt-acc",
+		},
+	}
+
+	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "gpt-5.4")
+	// OAuth account: 404 on Responses endpoint cannot fall back to raw CC (no api_key).
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.Contains(t, err.Error(), "OAuth account cannot fall back to raw CC")
+	// Only one upstream request (Responses path), then fails immediately without attempting fallback.
+	require.Len(t, upstream.requests, 1)
+}
+
+func TestForwardAsChatCompletions_NonOpenAISkipsResponsesPath(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	body := []byte(`{"model":"deepseek-chat","messages":[{"role":"user","content":"hello"}],"stream":false}`)
+	c.Request = httptest.NewRequest(http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	c.Request.Header.Set("Content-Type", "application/json")
+
+	// 非 OpenAI 平台（如 DeepSeek）在入口处即跳过 Responses 路径，直接走 raw CC。
+	// 即使 Extra 中误标 openai_responses_supported=true，也不会浪费请求探测。
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+		Body:       io.NopCloser(strings.NewReader(`data: [DONE]`)),
+	}}
+
+	account := &Account{
+		ID:          77,
+		Name:        "deepseek-key",
+		Platform:    "deepseek",
+		Type:        AccountTypeAPIKey,
+		Concurrency: 1,
+		Credentials: map[string]any{
+			"api_key":  "sk-deepseek-key",
+			"base_url": "https://api.deepseek.com",
+		},
+		Extra: map[string]any{
+			"openai_responses_supported": true,
+		},
+	}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+
+	result, err := svc.ForwardAsChatCompletions(context.Background(), c, account, body, "", "deepseek-chat")
+	// raw CC 路径因 GetOpenAIApiKey() 对非 OpenAI 平台返回空而失败。
+	require.Error(t, err)
+	require.Nil(t, result)
+	require.Contains(t, err.Error(), "api_key")
+	// Responses 路径从未被尝试，无多余上游请求。
+	require.Len(t, upstream.requests, 0)
 }

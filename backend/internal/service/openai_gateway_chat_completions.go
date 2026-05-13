@@ -66,6 +66,10 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 	if account.Type == AccountTypeAPIKey && !openai_compat.ShouldUseResponsesAPI(account.Extra) {
 		return s.forwardAsRawChatCompletions(ctx, c, account, body, defaultMappedModel)
 	}
+	// 非 OpenAI 平台不支持 Responses API，直接走 raw CC 路径（避免探测标记误设为 true 时走入无效的 Responses 路径）。
+	if account.Type == AccountTypeAPIKey && account.Platform != PlatformOpenAI {
+		return s.forwardAsRawChatCompletions(ctx, c, account, body, defaultMappedModel)
+	}
 
 	startTime := time.Now()
 
@@ -244,6 +248,38 @@ func (s *OpenAIGatewayService) ForwardAsChatCompletions(
 		respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 		_ = resp.Body.Close()
 		resp.Body = io.NopCloser(bytes.NewReader(respBody))
+
+		// 8a. Responses 端点返回 404，说明上游不支持 /v1/responses。
+		// 降级到 raw Chat Completions 直转，并异步修正探测标记，后续请求直接走 CC 路径。
+		if resp.StatusCode == http.StatusNotFound {
+			logger.L().Info("openai chat_completions: responses endpoint 404",
+				zap.Int64("account_id", account.ID),
+				zap.String("platform", string(account.Platform)),
+				zap.String("account_type", string(account.Type)),
+			)
+			if account.Type != AccountTypeAPIKey {
+				return nil, errors.New("upstream responses endpoint returned 404 (OAuth account cannot fall back to raw CC)")
+			}
+			// 同步更新内存中的 Extra，使同一请求生命周期内复用 account 指针时不再尝试 Responses 路径。
+			if account.Extra == nil {
+				account.Extra = make(map[string]any)
+			}
+			account.Extra[openai_compat.ExtraKeyResponsesSupported] = false
+			if s.accountRepo != nil {
+				accountID := account.ID
+				go func() {
+					updateCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if err := s.accountRepo.UpdateExtra(updateCtx, accountID, map[string]any{
+						openai_compat.ExtraKeyResponsesSupported: false,
+					}); err != nil {
+						logger.L().Warn("failed to persist openai_responses_supported flag",
+							zap.Int64("account_id", accountID), zap.Error(err))
+					}
+				}()
+			}
+			return s.forwardAsRawChatCompletions(ctx, c, account, body, defaultMappedModel)
+		}
 
 		upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
 		upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
